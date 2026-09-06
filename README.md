@@ -1,4 +1,4 @@
-# BookWalker Native Downloader · v1.0.0
+# BookWalker Native Downloader · v1.1.0
 
 **[Download from GreasyFork](https://greasyfork.org/en/scripts/594508-bookwalker-native-downloader)** · or install the [raw userscript](bookwalker-native-downloader.user.js) · MIT licensed
 

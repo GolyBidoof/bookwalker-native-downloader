@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BookWalker Native Downloader
 // @namespace    http://tampermonkey.net/
-// @version      1.0.0
+// @version      1.1.0
 // @description  Download the book open in the BookWalker viewer as a ZIP, or run its pages through the local mokuro-bridge app for Japanese OCR and optional upload. Fetches CDN page files directly and reassembles them offline.
 // @author       GolyBidoof
 // @match        https://viewer.bookwalker.jp/*
@@ -39,7 +39,7 @@
     'use strict';
 
     // App identity
-    const BWDD_VERSION = '1.0.0';
+    const BWDD_VERSION = '1.1.0';
     const BWDD_AUTHOR = 'GolyBidoof';
     // Where the panel's GitHub button points.
     const BWDD_REPO_URL = 'https://github.com/GolyBidoof/bookwalker-native-downloader';
@@ -2268,15 +2268,27 @@
         if (cps.length > 190) s = cps.slice(0, 190).join('').replace(/[. ]+$/, '');
         return s;
     }
-    // ZIP inner layout: Series/Volume/page-NNNN.jpg (flat at the archive root
-    // when no series can be derived — the same shape as before, hardened).
-    function zipLayoutOf(sv, fallbackTitle) {
-        const series = fsSafePath(sv && sv.series);
-        const vol = fsSafePath(sv && sv.volumeTitle) || fsSafePath(fallbackTitle);
-        if (!series) return '';
-        return series + '/' + vol + '/';
+    // Default archive/output name for the current book: the volume's own
+    // displayed title (series + volume number kept in the store's own format —
+    // e.g. "…1巻", "（１）", "… 1") with BookWalker's reader/edition labels in
+    // 【…】 removed wherever they sit. cleanTitle() only strips a *leading*
+    // 【…】 group, so mid/suffix labels like "…1巻【無料お試し版】" or
+    // "…【期間限定無料】 1" would otherwise leak into the generated name, and
+    // splitSeriesVolume() would rewrite "1巻"→"1" / "（１）"→"1" (it
+    // deliberately normalizes digits for the stat lookups) — losing the volume
+    // format the store itself uses. Like splitSeriesVolume/searchTitleCandidates
+    // above, any 【…】 group is treated as a store label, not series text.
+    function archiveDefaultName(rawTitle) {
+        let s = String(rawTitle || '').trim();
+        s = s.replace(/【[^】]*】/g, ' ');       // drop 【…】 groups, keep word separation
+        s = s.replace(/[ \t　]+/g, ' ').trim();  // tidy the whitespace the removal leaves behind
+        return fsSafePath(s);
     }
-    // Downloaded archive name: <series>.zip, else <title>.zip, else book.zip.
+    // ZIPs are flat: every page sits at the archive root as page-NNNN.jpg (no
+    // nested Series/Volume/ folder inside the zip — comic/manga readers expect
+    // pages flat in the archive). The series→volume nesting the bridge builds
+    // for OCR/upload runs is done on the bridge side from the session title
+    // (output/<series>/<volume>.cbz), so it is unaffected by flat ZIPs here.
     function zipBaseName(sv, fallbackTitle) {
         return fsSafePath(sv && sv.series) || fsSafePath(fallbackTitle) || 'book';
     }
@@ -2850,17 +2862,10 @@
   color: var(--bwdd-success);
 }
 .bwdd-bridge-info-mokuro.missing { color: var(--bwdd-danger); }
-.bwdd-bridge-info {
-  margin: 2px 0 6px;
-  padding: 9px 11px 10px;
-  background: var(--bwdd-bg-sunken);
-  border: 1px solid var(--bwdd-border);
-  border-radius: 10px;
-  font-size: 11px;
-  line-height: 1.5;
-  color: var(--bwdd-text-soft);
-}
-.bwdd-bridge-info[hidden] { display: none; }
+/* The bridge "?" infobox is positioned as an overlay popover (see the shared
+   .bwdd-name-pop / .bwdd-bridge-pop box below); this anchor keeps it glued to
+   the bridge status row it belongs to. */
+.bwdd-bridge-anchor { position: relative; }
 .bwdd-bridge-info-title {
   display: block;
   font-size: 11px;
@@ -3166,6 +3171,48 @@
 .bwdd-dest-localdir { display: flex; flex-direction: column; gap: 3px; }
 .bwdd-dest-hint { font-size: 11px; color: var(--bwdd-warn-text); background: var(--bwdd-warn-bg); border: 1px solid var(--bwdd-warn-border); border-radius: 6px; padding: 5px 7px; line-height: 1.4; }
 .bwdd-dest-hint code { font-family: ui-monospace, monospace; font-size: 10px; background: var(--bwdd-warn-code-bg); border-radius: 3px; padding: 0 3px; }
+/* Archive-name field (above the action buttons): one compact row of label,
+   input and "?" info dot; the popover it opens overlays the buttons below. */
+.bwdd-name {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.bwdd-name .bwdd-dest-label { flex: 0 0 auto; }
+.bwdd-name .bwdd-dest-input { flex: 1 1 auto; width: auto; min-width: 0; padding-top: 4px; padding-bottom: 4px; }
+.bwdd-name .bwdd-info-dot {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  min-width: 18px;
+  min-height: 18px;
+  font-size: 10px;
+}
+/* "?" popovers (archive-name field + Mokuro Bridge info): one shared overlay
+   look. Each popover is absolutely positioned under its own row (its anchor
+   sets position:relative) and overlays whatever sits below, so opening one
+   never takes layout space or pushes content around. */
+.bwdd-name-pop,
+.bwdd-bridge-pop {
+  position: absolute;
+  top: calc(100% + 4px);
+  z-index: 8;
+  width: 300px;
+  max-width: calc(100vw - 60px);
+  padding: 9px 11px;
+  background: var(--bwdd-bg);
+  color: var(--bwdd-text-soft);
+  border: 1px solid var(--bwdd-border-strong);
+  border-radius: 8px;
+  box-shadow: 0 10px 28px rgba(15, 23, 42, 0.18), 0 2px 6px rgba(15, 23, 42, 0.08);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.bwdd-name-pop { right: 0; }
+.bwdd-bridge-pop { left: 0; }
+.bwdd-name-pop > div + div { margin-top: 5px; }
+.bwdd-name-pop[hidden], .bwdd-bridge-pop[hidden] { display: none; }
 .bwdd-btn-fill {
   flex: 0 0 auto;
   font: 600 11px inherit;
@@ -3590,6 +3637,7 @@
         closeBtn.onclick = () => {
             try { if (bridgeTimer) { clearTimeout(bridgeTimer); bridgeTimer = null; } } catch (e) {}
             try { window.removeEventListener('keydown', onPanelKeydown); } catch (e) {}
+            try { document.removeEventListener('click', onNameDocClick); } catch (e) {}
             try { statsObs.disconnect(); } catch (e) {}
             try { root.remove(); } catch (e) {}
             try { if (edgeTab) edgeTab.remove(); } catch (e) {}
@@ -3651,7 +3699,7 @@
         bridgeRow.insertBefore(infoDot, bridgeText);
 
         const bridgeInfo = document.createElement('div');
-        bridgeInfo.className = 'bwdd-bridge-info';
+        bridgeInfo.className = 'bwdd-bridge-pop';
         bridgeInfo.hidden = true;
         const infoTitle = document.createElement('span');
         infoTitle.className = 'bwdd-bridge-info-title';
@@ -3705,6 +3753,13 @@
             bridgeInfo.hidden = !open;
             infoDot.setAttribute('aria-expanded', String(open));
         });
+
+        // Popover anchor: holds the bridge status row and its "?" infobox so
+        // the infobox can overlay just below the row (the same behavior as the
+        // archive-name popover) instead of pushing the content below it down.
+        const bridgeAnchor = document.createElement('div');
+        bridgeAnchor.className = 'bwdd-bridge-anchor';
+        bridgeAnchor.append(bridgeRow, bridgeInfo);
 
         // Human-readable busy reason from the bridge's /health fields.
         function busyReason(info) {
@@ -3906,6 +3961,101 @@
         btnOcr.title = btnOcrTip;
 
         btnRow.append(btnZip, btnOcr);
+
+        // --- Archive name (above the download buttons) ---------------------
+        // One compact row (label + textbox + "?" tooltip button) that sets the
+        // name of the archive the buttons below generate: the .zip "Save as
+        // ZIP" downloads, or the volume the bridge stores/uploads (.cbz) when
+        // OCR runs. Auto-filled with this book's own displayed title (series +
+        // volume in the store's format, promotional 【…】 labels removed -
+        // archiveDefaultName) and refreshed when the reader moves to another
+        // book, but a name the user typed is never overwritten. Empty = use
+        // the default again. The "?" opens a short popover explaining this.
+        const nameWrap = document.createElement('div');
+        nameWrap.className = 'bwdd-name';
+        const nameLabel = document.createElement('label');
+        nameLabel.className = 'bwdd-dest-label';
+        nameLabel.textContent = 'Archive name';
+        nameLabel.setAttribute('for', 'bwdd-archive-name');
+        const nameInput = document.createElement('input');
+        nameInput.id = 'bwdd-archive-name';
+        nameInput.type = 'text';
+        nameInput.className = 'bwdd-dest-input';
+        nameInput.autocomplete = 'off';
+        nameInput.spellcheck = false;
+        nameInput.placeholder = 'Auto-filled from this book';
+        nameInput.setAttribute('aria-label', 'Archive name - the name of the generated download (leave empty to use this book\u2019s series + volume)');
+        const nameInfoDot = document.createElement('button');
+        nameInfoDot.type = 'button';
+        nameInfoDot.className = 'bwdd-info-dot';
+        nameInfoDot.setAttribute('aria-label', 'About the archive name field');
+        nameInfoDot.setAttribute('aria-expanded', 'false');
+        nameInfoDot.setAttribute('aria-controls', 'bwdd-archive-name-pop');
+        nameInfoDot.title = 'What this field does';
+        nameInfoDot.textContent = '?';
+        // The popover sits below the row and overlays the buttons underneath,
+        // so opening it never takes layout space of its own.
+        const namePop = document.createElement('div');
+        namePop.className = 'bwdd-name-pop';
+        namePop.id = 'bwdd-archive-name-pop';
+        namePop.hidden = true;
+        namePop.setAttribute('role', 'note');
+        // Explanatory copy — kept short; the label + placeholder already say
+        // what the field is, this answers "what happens with the value".
+        const namePopP1 = document.createElement('div');
+        namePopP1.textContent = 'Name of the generated archive: the .zip \u201cSave as ZIP\u201d downloads, or the volume the Mokuro bridge stores/uploads when OCR runs.';
+        const namePopP2 = document.createElement('div');
+        namePopP2.textContent = 'Empty = this book\u2019s series + volume, exactly as the store writes it (e.g. \u2026 1\u5dfb, \uff08\uff11\uff09, \u2026 1).';
+        const namePopP3 = document.createElement('div');
+        namePopP3.textContent = 'ZIP pages sit flat inside the archive; OCR uploads still land under the series folder. Invalid file-name characters are stripped.';
+        namePop.append(namePopP1, namePopP2, namePopP3);
+        nameWrap.append(nameLabel, nameInput, nameInfoDot, namePop);
+        // Click the "?" to toggle the popover; click anywhere else (or press
+        // Esc while it is open) to dismiss it.
+        function setArchivePop(open) {
+            namePop.hidden = !open;
+            nameInfoDot.setAttribute('aria-expanded', String(open));
+        }
+        nameInfoDot.addEventListener('click', (e) => {
+            e.stopPropagation();
+            setArchivePop(namePop.hidden);
+        });
+        // Hoisted declaration so the panel's close button can detach it.
+        function onNameDocClick(e) {
+            if (!namePop.hidden && !nameWrap.contains(e.target)) setArchivePop(false);
+        }
+        document.addEventListener('click', onNameDocClick);
+
+        // The default the field was last auto-filled with (null = never, or the
+        // user has typed their own name since). syncArchiveDefault uses this to
+        // tell "still showing the auto default" apart from "user's own text",
+        // because only the former may be refreshed when the book/title changes.
+        let archiveAutoDefault = null;
+        // Keep the field's default in sync with the book shown in the reader
+        // and return the effective archive name for the current run (never
+        // empty):
+        //   • Empty field → fill with this book's default.
+        //   • Field still holding the previous auto default (title changed) →
+        //     swap in the new default.
+        //   • Anything the user typed → never touched.
+        // This also self-corrects while the title arrives in stages on one
+        // book (document.title first, then the richer state.cti).
+        function syncArchiveDefault(rawTitle) {
+            const dflt = archiveDefaultName(rawTitle);
+            const cur = nameInput.value;
+            if (!cur.trim()) {
+                if (dflt) { nameInput.value = dflt; archiveAutoDefault = dflt; }
+                else { archiveAutoDefault = null; }
+            } else if (archiveAutoDefault !== null && cur === archiveAutoDefault && dflt && dflt !== archiveAutoDefault) {
+                nameInput.value = dflt;
+                archiveAutoDefault = dflt;
+            } else {
+                archiveAutoDefault = (dflt && cur === dflt) ? dflt : null;
+            }
+            const safe = fsSafePath(nameInput.value.trim());
+            if (safe) return safe;
+            return dflt || fsSafePath(state.cid || '') || 'book';
+        }
 
         // --- Upload destination picker (OCR mode) ---
         // Lets the user choose where mokuro-bridge stores the finished volume,
@@ -4113,6 +4263,7 @@
             destSelect.disabled = destLocked;
             localDirInput.disabled = destLocked;
             localDirFill.disabled = destLocked;
+            nameInput.disabled = busy;
             destWrap.classList.toggle('bwdd-dest-locked', busy);
             if (busy) {
                 destWrap.setAttribute('aria-busy', 'true');
@@ -4236,7 +4387,7 @@
         // controls column, never an empty second one.
         const colMain = document.createElement('div');
         colMain.className = 'bwdd-col bwdd-col-main';
-        colMain.append(bridgeRow, bridgeInfo, mokuroAlert, destWrap, btnRow, barWrap, details, postRunRow);
+        colMain.append(bridgeAnchor, mokuroAlert, destWrap, nameWrap, btnRow, barWrap, details, postRunRow);
 
         const colStats = document.createElement('div');
         colStats.className = 'bwdd-col bwdd-col-stats';
@@ -4462,6 +4613,9 @@
         // listener alive for the life of the tab.
         function onPanelKeydown(e) {
             if (e.key !== 'Escape') return;
+            // An open archive-name popover is closed by Esc first (a second
+            // Esc then collapses the panel as usual).
+            if (!namePop.hidden) { setArchivePop(false); return; }
             // don't hijack Esc while the user is typing in a form control
             const t = e.target;
             if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
@@ -4471,7 +4625,7 @@
         }
         window.addEventListener('keydown', onPanelKeydown);
 
-        return { root, details, statsEl, barWrap, barDownload, barDescramble, barMokuro, barUpload, btnZip, btnOcr, destSelect, localDirInput, destHint, populateDestMethods, setRunLock, showReaderButton, hideReaderButton, showStoredButton, hideStoredButton };
+        return { root, details, statsEl, barWrap, barDownload, barDescramble, barMokuro, barUpload, btnZip, btnOcr, destSelect, localDirInput, destHint, populateDestMethods, setRunLock, showReaderButton, hideReaderButton, showStoredButton, hideStoredButton, syncArchiveDefault };
     }
 
     // Three-value Mokuro progress: done / received / total.
@@ -4876,7 +5030,7 @@
         return { result, plan };
     }
 
-    async function downloadTrialZip(ui, config, contents, title, sv, zipFolder, mode, details) {
+    async function downloadTrialZip(ui, config, contents, title, sv, mode, details, archiveName) {
         const { barDownload, barDescramble, barMokuro, barUpload, destSelect, localDirInput } = ui;
         const zip = mode === 'zip' ? { entries: [] } : null;
         const errors = [];
@@ -4924,7 +5078,7 @@
             if (!(await waitForBridgeIdle(60000))) {
                 throw new Error('The Mokuro Bridge is still busy with a previous OCR/upload — wait for it to finish, then try again.');
             }
-            const sess = await mokuroStartSession(title || 'book');
+            const sess = await mokuroStartSession(archiveName || title || 'book');
             mokuroSessionId = sess.session_id;
             runSafeTitle = sess.safe_title || sess.title || '';
             ocrPoll = setInterval(async () => {
@@ -4969,7 +5123,7 @@
                     okIdx.add(pageIdx);
                     bytes += blob.size;
                     fetched++;
-                    if (zip) zip.entries.push({ path: zipFolder + 'page-' + String(pageIdx).padStart(4, '0') + '.jpg', blob });
+                    if (zip) zip.entries.push({ path: 'page-' + String(pageIdx).padStart(4, '0') + '.jpg', blob });
                     if (mode === 'ocr' && mokuroSessionId) {
                         // Cover = first page: push it to the destination right
                         // away (before OCR finishes) so the folder + upload bar
@@ -5052,7 +5206,7 @@
             const url = URL.createObjectURL(zipBlob);
             const a = document.createElement('a');
             a.href = url;
-            a.download = zipBaseName(sv, title) + '.zip';
+            a.download = (archiveName || zipBaseName(sv, title)) + '.zip';
             document.body.appendChild(a);
             a.click();
             setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 4000);
@@ -5128,7 +5282,7 @@
             if ((state.plaintextConfig || !keys) && (mode === 'zip' || mode === 'ocr')) {
                 const titleT = cleanTitle(state.cti || document.title) || state.cid;
                 const svT = splitSeriesVolume(state.cti || titleT);
-                const zipFolderT = zipLayoutOf(svT, titleT);
+                const archiveNameT = ui.syncArchiveDefault(state.cti || document.title || '');
                 barWrap.style.display = 'flex';
                 barDownload.wrap.style.display = 'flex';
                 barDescramble.wrap.style.display = 'flex';
@@ -5152,7 +5306,7 @@
                     type: 'Sample / Trial'
                 });
                 if (svT.series) fetchAndRenderStats(statsEl, svT.series, svT.volNum);
-                const trialOk = await downloadTrialZip(ui, config, contents, titleT, svT, zipFolderT, mode, details);
+                const trialOk = await downloadTrialZip(ui, config, contents, titleT, svT, mode, details, archiveNameT);
                 if (trialOk) finishedOk = true;
                 return;
             }
@@ -5163,6 +5317,7 @@
             const H = firstPage && firstPage.Size ? firstPage.Size.Height : '?';
             const title = cleanTitle(state.cti || document.title) || state.cid;
             const sv = splitSeriesVolume(state.cti || title);
+            const archiveName = ui.syncArchiveDefault(state.cti || document.title || '');
 
             renderBookCard(statsEl, {
                 title,
@@ -5180,7 +5335,6 @@
             if (sv.series) fetchAndRenderStats(statsEl, sv.series, sv.volNum);
 
             const zip = mode === 'zip' ? { entries: [] } : null;
-            const zipFolder = zipLayoutOf(sv, title);
 
             let mokuroSessionId = null;
             let ocrPoll = null;
@@ -5203,7 +5357,7 @@
                 if (!(await waitForBridgeIdle(60000))) {
                     throw new Error('The Mokuro Bridge is still busy with a previous OCR/upload — wait for it to finish, then try again.');
                 }
-                const sess = await mokuroStartSession(title);
+                const sess = await mokuroStartSession(archiveName || title);
                 mokuroSessionId = sess.session_id;
                 runSafeTitle = sess.safe_title || sess.title || '';
                 ocrPoll = setInterval(async () => {
@@ -5288,7 +5442,7 @@
                     okIdx.add(job.index);
                     failedIdx.delete(job.index);
                     bytes += blob.size;
-                    if (zip) zip.entries.push({ path: zipFolder + 'page-' + String(job.index).padStart(4, '0') + '.jpg', blob });
+                    if (zip) zip.entries.push({ path: 'page-' + String(job.index).padStart(4, '0') + '.jpg', blob });
                     if (state.cid) cachePage(state.cid, job.index, blob);
                     // Cover = first page: push it to the destination right
                     // away (before OCR finishes) so the folder + upload bar
@@ -5501,7 +5655,7 @@
                     if (cached) {
                         okIdx.add(idx);
                         bytes += cached.size;
-                        if (zip) zip.entries.push({ path: zipFolder + 'page-' + String(idx).padStart(4, '0') + '.jpg', blob: cached });
+                        if (zip) zip.entries.push({ path: 'page-' + String(idx).padStart(4, '0') + '.jpg', blob: cached });
                         if (mokuroSessionId) { ocrBuffer.set(idx, cached); if (idx === nextOcr) sendOcrStreaming(); }
                         cachedCount++;
                         continue;
@@ -5631,7 +5785,7 @@
             const url = URL.createObjectURL(zipBlob);
             const a = document.createElement('a');
             a.href = url;
-            a.download = zipBaseName(sv, title) + '.zip';
+            a.download = (archiveName || zipBaseName(sv, title)) + '.zip';
             document.body.appendChild(a);
             a.click();
             setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 4000);
@@ -5730,6 +5884,10 @@
             let statsKicked = false;
             for (let i = 0; i < 40; i++) {
                 await new Promise(r => setTimeout(r, 500));
+                // Keep the archive-name field's default in sync with the book
+                // shown in the reader (safe: it never overwrites a name the
+                // user typed — see syncArchiveDefault).
+                try { ui.syncArchiveDefault(state.cti || document.title || ''); } catch (e) {}
                 if (!statsKicked) {
                     // Start the catalog lookups as soon as the series name is
                     // known (state.cti) — not once the whole preview finishes
@@ -5757,7 +5915,7 @@
     if (BWDD_DEBUG) {
         // pageSeedsNo/b8gNo (not the old pageSeeds/b8g wrappers) so debuggers can
         // probe any specific page number, not just page 0.
-        try { window.__bwdd = { decodeConfig, pageSeedsNo, A9p, b8gNo, state, buildWorkerSource, fetchAndDescramble, cleanTitle, splitSeriesVolume, fsSafePath, zipLayoutOf, zipBaseName, crc32Bytes, buildStoreZip }; } catch (e) {}
+        try { window.__bwdd = { decodeConfig, pageSeedsNo, A9p, b8gNo, state, buildWorkerSource, fetchAndDescramble, cleanTitle, splitSeriesVolume, fsSafePath, zipBaseName, crc32Bytes, buildStoreZip }; } catch (e) {}
         try { window.__bwddUI = { renderStatsCards, renderBookCard, renderNativelyCard, renderMangaKotobaCard, setBar, showBars }; } catch (e) {}
     }
 })();
