@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         BookWalker Downloader
+// @name         BookWalker Native Downloader
 // @namespace    http://tampermonkey.net/
 // @version      1.0.0
 // @description  Download the book open in the BookWalker viewer as a ZIP, or run its pages through the local mokuro-bridge app for Japanese OCR and optional upload. Fetches CDN page files directly and reassembles them offline.
@@ -18,10 +18,13 @@
 // CREDITS
 //   - BookWalker viewer protocol reverse-engineered and validated against
 //     live HAR captures + the bookworm offline client (github.com/aaa4xu/bookworm).
-//   - Reading stats from LearnNatively (learnnatively.com) and manga-kotoba
-//     (manga-kotoba.com); their teams own that data and its styling.
-//   - OCR via mokuro, run through the companion mokuro-bridge
-//     app (github.com/GolyBidoof/mokuro-bridge). Upload backend is the bridge's own.
+//   - Reading stats from LearnNatively (learnnatively.com, by Brandon) and
+//     manga-kotoba (manga-kotoba.com, by ChristopherFritz); they own that
+//     data and its styling.
+//   - OCR via mokuro: a performant fork of kha-white/mokuro
+//     (github.com/GolyBidoof/mokuro), run through the companion
+//     mokuro-bridge app (github.com/GolyBidoof/mokuro-bridge);
+//     upload backend is the bridge's own.
 //   - Built with DeepSeek V4 Flash (deepseek.com), the coding model that
 //     reverse-engineered and ported the crypto/descramble logic with the author.
 //
@@ -38,9 +41,8 @@
     // App identity
     const BWDD_VERSION = '1.0.0';
     const BWDD_AUTHOR = 'GolyBidoof';
-    // Where the panel's GitHub button points (repo not public yet — add a
-    // remote and push when ready).
-    const BWDD_REPO_URL = 'https://github.com/GolyBidoof/bookwalker-downloader';
+    // Where the panel's GitHub button points.
+    const BWDD_REPO_URL = 'https://github.com/GolyBidoof/bookwalker-native-downloader';
 
     // =====================================================================
     // 1. Capture the viewer's own network responses (browser data reuse)
@@ -55,6 +57,18 @@
         configBody: null,  // encrypted configuration_pack.json text
         configFromUrl: null
     };
+
+    // Shared protocol/presentation constants — single source of truth for
+    // values that used to be inlined at every call site.
+    const AUTH_PARAM_KEYS = ['hti', 'cfg', 'bid', 'uuid', 'pfCd', 'Policy', 'Signature', 'Key-Pair-Id'];
+    const JPEG_QUALITY = 0.92;                // JPEG re-encode quality for output pages
+    const EST_BYTES_PER_PAGE = 350 * 1024;    // rough per-page size used for size estimates
+    // Debug-only: internals on window.* are exposed only when the viewer URL
+    // carries ?bwddDebug=1 (used while validating against HAR captures), so
+    // page scripts can't reach mutable script state by default.
+    const BWDD_DEBUG = (() => {
+        try { return new URLSearchParams(location.search).has('bwddDebug'); } catch (e) { return false; }
+    })();
 
     function findInNFBR(win) {
         const out = { auth: null, baseUrl: null, config: null, cti: null };
@@ -269,65 +283,62 @@
         try { return window.location.origin; } catch (e) { return ''; }
     }
 
+    // Single reader for captured API/config responses — used by both the
+    // fetch and XHR hooks below so the two capture paths can never classify an
+    // endpoint differently (they once duplicated this and drifted). Handles:
+    //   /browserWebApi/c | /trial-page/c  → full auth reply (auth_info + url)
+    //   /browserWebApi/pb                 → incremental auth_info (policy refresh)
+    //   configuration_pack.json           → encrypted manifest text (best dir wins)
+    function absorbApiResponse(url, text) {
+        try {
+            if (url.includes('/browserWebApi/c') || url.includes('/trial-page/c')) {
+                recordApiBase(url);
+                const d = JSON.parse(text);
+                if (d.auth_info && d.url) { state.auth = d.auth_info; state.baseUrl = d.url; state.cti = d.cti || state.cti; }
+                if (d.auth_info && !d.url) { state.auth = Object.assign({}, state.auth || {}, d.auth_info); }
+            } else if (url.includes('/browserWebApi/pb')) {
+                recordApiBase(url);
+                const d = JSON.parse(text);
+                if (d.auth_info) {
+                    // pb rotates the CloudFront policy — a changed signature
+                    // resets the request-count budget (fetch and XHR capture
+                    // paths now behave identically here).
+                    const before = authPolicySig();
+                    state.auth = Object.assign({}, state.auth || {}, d.auth_info);
+                    if (authPolicySig() !== before) resetAuthBudget();
+                }
+            } else if (url.includes('configuration_pack.json')) {
+                const dir = (url.split('?')[0] || '').replace(/configuration_pack\.json$/, '');
+                if (!state.configBody || !state.configFromUrl || configPrio(dir) < configPrio(state.configFromUrl)) {
+                    state.configBody = text;
+                    state.configFromUrl = dir;
+                }
+            }
+        } catch (e) {}
+    }
+
     // Hooks
     const origFetch = window.fetch;
     window.fetch = function (...args) {
         const url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url) || '';
         const p = origFetch.apply(this, args);
-        if (url.includes('/browserWebApi/c') || url.includes('/trial-page/c')) {
-            recordApiBase(url);
-            p.then(r => r.clone().text()).then(t => { try {
-                const d = JSON.parse(t);
-                if (d.auth_info && d.url) { state.auth = d.auth_info; state.baseUrl = d.url; state.cti = d.cti || state.cti; }
-                if (d.auth_info && !d.url) { state.auth = Object.assign({}, state.auth || {}, d.auth_info); }
-            } catch (e) {} }).catch(() => {});
-        } else if (url.includes('/browserWebApi/pb')) {
-            recordApiBase(url);
-            p.then(r => r.clone().text()).then(t => { try {
-                const d = JSON.parse(t);
-                if (d.auth_info) { state.auth = Object.assign({}, state.auth || {}, d.auth_info); }
-            } catch (e) {} }).catch(() => {});
-        } else if (url.includes('configuration_pack.json')) {
-            p.then(r => r.clone().text()).then(t => {
-                const dir = (url.split('?')[0] || '').replace(/configuration_pack\.json$/, '');
-                if (!state.configBody || !state.configFromUrl || configPrio(dir) < configPrio(state.configFromUrl)) {
-                    state.configBody = t;
-                    state.configFromUrl = dir;
-                }
-            }).catch(() => {});
+        if (url.includes('/browserWebApi/c') || url.includes('/trial-page/c') ||
+            url.includes('/browserWebApi/pb') || url.includes('configuration_pack.json')) {
+            p.then(r => r.clone().text()).then(t => absorbApiResponse(url, t)).catch(() => {});
         }
         return p;
     };
-
     const origOpen = XMLHttpRequest.prototype.open;
     const origSend = XMLHttpRequest.prototype.send;
     XMLHttpRequest.prototype.open = function (m, u) { this.__bwUrl = u; return origOpen.apply(this, arguments); };
     XMLHttpRequest.prototype.send = function () {
         try {
             this.addEventListener('load', () => {
-                try {
-                    const u = this.__bwUrl || '';
-                    if (u.includes('/browserWebApi/c') || u.includes('/trial-page/c')) {
-                        recordApiBase(u);
-                        const d = JSON.parse(this.responseText);
-                        if (d.auth_info && d.url) { state.auth = d.auth_info; state.baseUrl = d.url; state.cti = d.cti || state.cti; }
-                        if (d.auth_info && !d.url) { state.auth = Object.assign({}, state.auth || {}, d.auth_info); }
-                    } else if (u.includes('/browserWebApi/pb')) {
-                        recordApiBase(u);
-                        const d = JSON.parse(this.responseText);
-                        if (d.auth_info) {
-                            const before = authPolicySig();
-                            state.auth = Object.assign({}, state.auth || {}, d.auth_info);
-                            if (authPolicySig() !== before) resetAuthBudget();
-                        }
-                    } else if (u.includes('configuration_pack.json')) {
-                        const dir = (u.split('?')[0] || '').replace(/configuration_pack\.json$/, '');
-                        if (!state.configBody || !state.configFromUrl || configPrio(dir) < configPrio(state.configFromUrl)) {
-                            state.configBody = this.responseText;
-                            state.configFromUrl = dir;
-                        }
-                    }
-                } catch (e) {}
+                const u = this.__bwUrl || '';
+                if (u.includes('/browserWebApi/c') || u.includes('/trial-page/c') ||
+                    u.includes('/browserWebApi/pb') || u.includes('configuration_pack.json')) {
+                    absorbApiResponse(u, this.responseText);
+                }
             });
         } catch (e) {}
         return origSend.apply(this, arguments);
@@ -771,9 +782,6 @@
         e4j(x, y, lbw, bh);
         return out;
     }
-    function pageSeeds(pageId, pageConfig, k1, k2, k3) {
-        return pageSeedsNo(pageId, pageConfig, k1, k2, k3, 0);
-    }
     function pageSeedsNo(pageId, pageConfig, k1, k2, k3, no) {
         const list = pageConfig.FileLinkInfo.PageLinkInfoList;
         const Page = (list[no] && list[no].Page) || list[0].Page;
@@ -870,9 +878,6 @@
         pval(14, (lef & 255) ^ b9w[7]);
         return String.fromCharCode(...mef);
     }
-    function b8g(pageId, k1, k2, k3) {
-        return pageId + '/' + v_jdf('0') + v_ndf(v_hdf(k1, k2, k3), pageId, '0') + '.jpeg';
-    }
     function b8gNo(pageId, k1, k2, k3, no) {
         const fname = String(no == null ? 0 : no);
         return pageId + '/' + v_jdf(fname) + v_ndf(v_hdf(k1, k2, k3), pageId, fname) + '.jpeg';
@@ -892,24 +897,10 @@
     }
     function authQuery(auth) {
         const p = new URLSearchParams();
-        for (const k of ['hti', 'cfg', 'bid', 'uuid', 'pfCd', 'Policy', 'Signature', 'Key-Pair-Id']) {
+        for (const k of AUTH_PARAM_KEYS) {
             if (auth[k] !== undefined && auth[k] !== null) p.set(k, auth[k]);
         }
         return p.toString();
-    }
-    async function refreshAuth() {
-        const cr = Math.floor(Math.random() * 1e18) + 1e18;
-        const u1 = getU1();
-        const url = '/browserWebApi/c?cid=' + encodeURIComponent(state.cid) +
-            '&u1=' + encodeURIComponent(u1) + '&BID=' + encodeURIComponent(getBID()) + '&cr=' + cr;
-        const res = await fetch(url, { credentials: 'include' });
-        const d = await res.json();
-        if (d.status === '200' && d.auth_info && d.url) {
-            state.auth = d.auth_info;
-            state.baseUrl = d.url;
-            state.cti = d.cti || state.cti;
-        }
-        return d;
     }
 
     // =====================================================================
@@ -918,6 +909,7 @@
     function buildWorkerSource() {
         const deps = [
             'const MASK32 = 0xFFFFFFFF;',
+            'const AUTH_PARAM_KEYS = ' + JSON.stringify(AUTH_PARAM_KEYS) + ';',
             'const B2Y_TRIPLES = ' + JSON.stringify(B2Y_TRIPLES) + ';',
             'const XSHIFT = [' + XSHIFT.map(f => f.toString()).join(',') + '];',
             'const B2Y_SEED = 2463534242;',
@@ -945,7 +937,7 @@
                 let blob = inputBlob;
                 if (!blob) {
                     const qs = new URLSearchParams();
-                    for (const k of ['hti', 'cfg', 'bid', 'uuid', 'pfCd', 'Policy', 'Signature', 'Key-Pair-Id']) {
+                    for (const k of AUTH_PARAM_KEYS) {
                         if (auth[k] !== undefined && auth[k] !== null) qs.set(k, auth[k]);
                     }
                     const url = baseUrl + relPath + '?' + qs.toString();
@@ -1165,7 +1157,7 @@
 
     function cdnUrl(relPath, fileKey) {
         const qs = new URLSearchParams();
-        for (const k of ['hti', 'cfg', 'bid', 'uuid', 'pfCd', 'Policy', 'Signature', 'Key-Pair-Id']) {
+        for (const k of AUTH_PARAM_KEYS) {
             if (state.auth[k] !== undefined && state.auth[k] !== null) qs.set(k, state.auth[k]);
         }
         let base = state.baseUrl;
@@ -1606,10 +1598,22 @@
             return out;
         } catch (e) { return null; }
     }
-    async function fetchMangaStats(seriesTitle, volumeNum) {
-        const mk = await lookupMangaKotoba(seriesTitle, volumeNum);
-        const ln = await lookupLearnNatively(seriesTitle, volumeNum);
-        return { mangaKotoba: mk, learnNatively: ln };
+    // Fire both catalog lookups at once and render each card the moment its
+    // own lookup resolves. The old fetchMangaStats awaited Manga-Kotoba first
+    // and only then started LearnNatively (search API → series page → book
+    // page), so nothing appeared until both chains finished — and the MK card
+    // waited on LN's extra requests. Here each card shows as soon as it is
+    // found; a slow or missing site only delays (or skips) its own card.
+    // Both lookups swallow their failures and resolve to null, so a null
+    // result simply renders nothing.
+    function fetchAndRenderStats(statsEl, seriesTitle, volumeNum) {
+        if (!statsEl || !seriesTitle) return;
+        lookupMangaKotoba(seriesTitle, volumeNum)
+            .then(mk => { if (mk) upsertCard(statsEl, 'manga-kotoba', () => renderMangaKotobaCard(mk)); })
+            .catch(e => console.warn('[bwdd] Manga-kotoba lookup error:', e && e.message));
+        lookupLearnNatively(seriesTitle, volumeNum)
+            .then(ln => { if (ln) upsertCard(statsEl, 'natively', () => renderNativelyCard(ln)); })
+            .catch(e => console.warn('[bwdd] LearnNatively lookup error:', e && e.message));
     }
 
     // Card helpers (terse but accessible: real links, labelled pills, dl rows)
@@ -1636,7 +1640,10 @@
         if (!container) return null;
         const old = container.querySelector('.bwdd-card[data-card="' + key + '"]');
         if (old) old.remove();
+        // buildFn may legitimately return null when there is nothing to show
+        // (e.g. a Manga-Kotoba card with no volume and no series link yet).
         const card = buildFn();
+        if (!card) return null;
         card.dataset.card = key;
         const book = container.querySelector('.bwdd-card[data-card="book"]');
         if (key === 'book') {
@@ -1803,7 +1810,6 @@
 
             if (metaObj.pages) grid.appendChild(badge('Pages', metaObj.pages, 'Number of page images in this book'));
             if (metaObj.resolution) grid.appendChild(badge('Page Size', metaObj.resolution, 'Resolution of the page images (width × height)'));
-            if (metaObj.estSize) grid.appendChild(badge('Est. Size', metaObj.estSize, 'Rough total size of the pages (about 350 KB per page)'));
             if (metaObj.type) grid.appendChild(badge('Edition', metaObj.type, 'Whether this is a purchased edition or a sample / trial volume'));
 
             card.appendChild(grid);
@@ -1819,12 +1825,25 @@
     // Shown (via the run's catch-all) when the bridge cannot be reached.
     const MOKURO_BRIDGE_OFFLINE_MSG =
         'The Mokuro Bridge app is not running.\n\n' +
-        'Get and start mokuro-bridge (github.com/GolyBidoof/mokuro-bridge), ' +
-        'e.g. run ./run.sh from its folder, then click “Save and run through Mokuro” again.';
+        'Get and start mokuro-bridge (github.com/GolyBidoof/mokuro-bridge) — its ' +
+        'README shows the start command for your OS (macOS/Linux: ./run.sh from ' +
+        'its folder), then click “Save and run through Mokuro” again.';
 
+    // Hysteresis so a single dropped /health probe (or a slow response during
+    // a heavy upload) can't flip the UI to "offline" and hide the bars. The
+    // dot/message only go grey after BRIDGE_FAIL_LIMIT consecutive failures.
+    const BRIDGE_FAIL_LIMIT = 3;
+    let bridgeConsecFail = 0;
     async function bridgeHealth() {
-        try { const r = await fetchWithTimeout(MOKURO_BRIDGE_URL + '/health', { cache: 'no-store' }, 2000); return r.ok; }
-        catch (e) { return false; }
+        try {
+            const r = await fetchWithTimeout(MOKURO_BRIDGE_URL + '/health', { cache: 'no-store' }, 2000);
+            const ok = r.ok;
+            bridgeConsecFail = ok ? 0 : bridgeConsecFail + 1;
+            return ok || bridgeConsecFail < BRIDGE_FAIL_LIMIT;
+        } catch (e) {
+            bridgeConsecFail++;
+            return bridgeConsecFail < BRIDGE_FAIL_LIMIT;
+        }
     }
     // Cached /health payload (upload backends, output dir, version…).
     let bridgeInfo = null;
@@ -1944,6 +1963,20 @@
         if (!res.ok) throw new Error(d.detail || 'HTTP ' + res.status);
         return d;
     }
+    // Early cover upload: push the first descrambled page to the destination
+    // as <title>.webp immediately (the cover), before OCR finishes, so the
+    // user sees upload activity start at once. {method, localDir} must match
+    // the run's destination (the dropdown is locked during the run).
+    async function mokuroUploadCover(sessionId, blob, opts = {}) {
+        const fd = new FormData();
+        fd.append('cover', blob, 'cover.jpg');
+        if (opts.method) fd.append('upload_method', opts.method);
+        if (opts.method === 'local' && opts.localDir) fd.append('local_dir', opts.localDir);
+        const res = await fetchWithTimeout(MOKURO_BRIDGE_URL + '/session/' + sessionId + '/cover', { method: 'POST', body: fd }, 120000);
+        const d = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error((d && d.detail) || 'HTTP ' + res.status);
+        return d;
+    }
     async function mokuroStatus(sessionId) {
         try {
             const res = await fetchWithTimeout(MOKURO_BRIDGE_URL + '/session/' + sessionId + '/status', {}, 5000);
@@ -1980,7 +2013,12 @@
                 seen.add(key);
                 if (uploadUrls.some(e => e.file === f && e.url === u)) return;
                 uploadUrls.push({ file: f, url: u });
-                if (!storedUrl && /^https?:\/\//i.test(u)) storedUrl = u;
+                // Prefer the .cbz (the volume archive itself) for the "Open
+                // stored file" action; the cover .webp uploads first, so
+                // without this preference the button would point at an image.
+                if (/^https?:\/\//i.test(u)) {
+                    if (!storedUrl || /\.cbz$/i.test(f)) storedUrl = u;
+                }
             };
             if (typeof msg.url === 'string' && msg.url) add(msg.file, msg.url);
             const up = msg.upload || {};
@@ -2052,39 +2090,87 @@
         if (storedUrl) finalResult.storedUrl = storedUrl;
         return finalResult;
     }
-    // Build an upload-bar updater that accumulates the bridge's per-file
-    // upload_progress frames into an overall byte-weighted percent:
-    //   sum(current_bytes of all files) / sum(total_bytes of all files).
-    // Without this the bar resets to 0 at every file boundary (the .cbz hits
-    // 100%, then the .mokuro file starts at 0%), which reads as a jump.
-    // A file is only counted once its bytes actually flow, so starting the
-    // next file doesn't drop the shown % before its first bytes arrive.
+    // Multi-file upload progress for the Store/Upload bar. Tracks a list of
+    // files in upload order (seeded up front from the bridge's "upload" frame
+    // `files:` list, then fed live per-file progress). The label reads
+    //   "1/3 · 62% · 65.0 MB / 104.8 MB · 5.1 MiB/s"
+    // i.e. file k of N · overall % · bytes · speed — no file name clutter.
+    // The fill is the byte-weighted overall % (sum done / sum total), which
+    // is monotonic because every file's total is known before it uploads.
+    // The k/N and size totals are *kept after completion* — finishing never
+    // blanks the bar; the stage handler may append "done" separately.
     function makeUploadBarUpdater(bar) {
-        const files = new Map(); // file -> {cur, tot}
-        return function onUploadFrame(ev) {
+        const order = [];              // file names in first-seen (upload) order
+        const byName = new Map();      // name -> {cur, tot}
+        const rec = (name) => {
+            let r = byName.get(name);
+            if (!r) { r = { cur: 0, tot: 0 }; byName.set(name, r); order.push(name); }
+            return r;
+        };
+        let seeded = false;            // full plan announced by the bridge
+        let done = 0;                  // files fully uploaded (tot>0 && cur>=tot)
+        const feed = function onUploadFrame(ev) {
             if (!bar) return;
             bar.wrap.style.display = 'flex';
-            const f = ev.file || '';
-            if (f) {
-                const rec = files.get(f) || { cur: 0, tot: 0 };
-                if (ev.currentBytes > 0) {
-                    rec.cur = Math.max(rec.cur, ev.currentBytes);
-                    if (ev.totalBytes > 0) rec.tot = Math.max(rec.tot, ev.totalBytes);
-                }
-                files.set(f, rec);
+            const name = ev.file || '';
+            if (name) {
+                const r = rec(name);
+                if (ev.totalBytes > 0) r.tot = Math.max(r.tot, ev.totalBytes);
+                if (ev.currentBytes > 0) r.cur = Math.max(r.cur, ev.currentBytes);
             }
             let sumCur = 0, sumTot = 0;
-            for (const r of files.values()) { sumCur += r.cur; sumTot += r.tot; }
+            done = 0;
+            for (const n of order) {
+                const r = byName.get(n);
+                sumCur += r.cur; sumTot += r.tot;
+                if (r.tot > 0 && r.cur >= r.tot) done++;
+            }
             let overall;
             if (sumTot > 0) overall = Math.min(100, (sumCur / sumTot) * 100);
             else if (ev.percent != null) overall = ev.percent;
             else overall = 0;
-            let label = (ev.file ? ev.file.replace(/\.\w+$/, '') + ' ' : '') + overall.toFixed(0) + '%';
-            if (sumTot > 0) label += ' · ' + fmtBytes(sumCur) + ' / ' + fmtBytes(sumTot);
-            else if (ev.percent != null && ev.totalBytes > 0) label += ' · ' + fmtBytes(ev.currentBytes || 0) + ' / ' + fmtBytes(ev.totalBytes);
-            if (ev.speed) label += ' · ' + ev.speed;
-            setBar(bar, overall, label);
+            let parts = [];
+            if (seeded && order.length > 0) {
+                // Always show k/N against the full plan: k = files fully done
+                // (0 at the very start), never a premature "1/3" just because
+                // one file was announced.
+                parts.push(Math.min(done, order.length) + '/' + order.length);
+            }
+            parts.push(overall.toFixed(0) + '%');
+            if (sumTot > 0) parts.push(fmtBytes(sumCur) + ' / ' + fmtBytes(sumTot));
+            else if (ev.percent != null && ev.totalBytes > 0) parts.push(fmtBytes(ev.currentBytes || 0) + ' / ' + fmtBytes(ev.totalBytes));
+            if (ev.speed && overall < 100) parts.push(ev.speed);
+            setBar(bar, overall, parts.join(' · '));
         };
+        // Pre-register the whole upload plan (the bridge announces it in the
+        // initial "upload" frame): {file, total_bytes}[]. With a full
+        // denominator up front the overall % is honest (no false 100% when a
+        // single file finishes) and the k/N counter always counts against N.
+        feed.seed = function seed(list) {
+            if (!Array.isArray(list)) return;
+            for (const it of list) {
+                if (it && typeof it.file === 'string' && it.file) {
+                    const r = rec(it.file);
+                    if (it.total_bytes > 0) r.tot = Math.max(r.tot, it.total_bytes);
+                }
+            }
+            if (list.length) seeded = true;
+        };
+        // True once any file has been registered (used to avoid clobbering
+        // early-cover progress when the finalize phase reuses this feed).
+        feed.hasAny = function hasAny() { return order.length > 0; };
+        // Summary accessors: the final k/N and total size stay readable after
+        // the run so the caller can keep them on the bar.
+        feed.summary = function summary() {
+            let sumCur = 0, sumTot = 0, d = 0;
+            for (const n of order) {
+                const r = byName.get(n);
+                sumCur += r.cur; sumTot += r.tot;
+                if (r.tot > 0 && r.cur >= r.tot) d++;
+            }
+            return { done: d, total: order.length, sumCur, sumTot };
+        };
+        return feed;
     }
     // Ask the bridge to finalize + store a volume.
     //   opts.method   — upload_method id ('local' | 'mega' | 'drive' | 'onedrive' | 'webdav').
@@ -2153,6 +2239,46 @@
         series = series.replace(/[\\/:*?"<>|\x00-\x1f]/g, '').trim();
         const volumeTitle = (series + ' ' + (volNum != null ? volNum : '')).trim();
         return { series, volNum, volumeTitle };
+    }
+    // ── Cross-platform (Windows / Linux / macOS) output naming ────────────
+    // Everything the user ultimately saves to disk (ZIP inner folders, the
+    // downloaded .zip name) must be legal on the *worst-case* target
+    // filesystem — Windows. cleanTitle() above already drops the characters
+    // Windows forbids in file names (\/:*?"<>| plus C0 controls); fsSafePath()
+    // additionally covers the rules that only bite on Windows:
+    //   • trailing dots/spaces — NTFS strips them silently, so what gets
+    //     created is not what the user named (and a name that is only dots
+    //     becomes '' or '.' and fails),
+    //   • reserved device names (CON, PRN, AUX, NUL, COM1–9, LPT1–9, CONIN$,
+    //     CONOUT$) — creating the file/folder fails or it gets auto-renamed,
+    //   • component length — NTFS caps a path component at 255 UTF-16 units;
+    //     we cap at 190 code points so the whole extraction path stays well
+    //     inside the legacy 260-char Windows limit too.
+    // Linux/macOS tolerate all of this output unchanged.
+    const BWDD_RESERVED_DEVICE = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9]|conin\$|conout\$)(?:\..*)?$/i;
+    function fsSafePath(name) {
+        let s = cleanTitle(name);
+        if (!s) return '';
+        // Strip any trailing run of ASCII dots/spaces (Windows drops them
+        // when creating the file/folder).
+        s = s.replace(/[. ]+$/, '').trim();
+        if (!s || s === '.' || s === '..') return '';
+        if (BWDD_RESERVED_DEVICE.test(s)) s = '_' + s;   // CON → _CON
+        const cps = Array.from(s);
+        if (cps.length > 190) s = cps.slice(0, 190).join('').replace(/[. ]+$/, '');
+        return s;
+    }
+    // ZIP inner layout: Series/Volume/page-NNNN.jpg (flat at the archive root
+    // when no series can be derived — the same shape as before, hardened).
+    function zipLayoutOf(sv, fallbackTitle) {
+        const series = fsSafePath(sv && sv.series);
+        const vol = fsSafePath(sv && sv.volumeTitle) || fsSafePath(fallbackTitle);
+        if (!series) return '';
+        return series + '/' + vol + '/';
+    }
+    // Downloaded archive name: <series>.zip, else <title>.zip, else book.zip.
+    function zipBaseName(sv, fallbackTitle) {
+        return fsSafePath(sv && sv.series) || fsSafePath(fallbackTitle) || 'book';
     }
     function fmtBytes(n) {
         if (n < 1024) return n + ' B';
@@ -2439,7 +2565,7 @@
         };
     })();
     try { bwddTheme.start(); } catch (e) {}
-    try { window.__bwddTheme = bwddTheme; } catch (e) {}
+    if (BWDD_DEBUG) { try { window.__bwddTheme = bwddTheme; } catch (e) {} }
 
     let __bwddCssInjected = false;
     function injectStyles() {
@@ -2601,6 +2727,7 @@
 }
 .bwdd-ctrl-btn:hover { background: var(--bwdd-bg-hover); color: var(--bwdd-text-strong); }
 .bwdd-ctrl-btn:focus-visible { outline: 2px solid var(--bwdd-link); outline-offset: 2px; }
+.bwdd-ctrl-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
 /* Scrollable Body */
 .bwdd-body {
@@ -3407,7 +3534,7 @@
         const title = document.createElement('h2');
         title.id = 'bwdd-panel-title';
         title.className = 'bwdd-title';
-        title.innerHTML = '<span class="bwdd-icon" aria-hidden="true">📖</span> BookWalker Downloader';
+        title.innerHTML = '<span class="bwdd-icon" aria-hidden="true">📖</span> BookWalker Native Downloader';
 
         // Version tag row: "vX.Y.Z by <author>" with a GitHub link right next
         // to it (the repo this script will live in).
@@ -3461,7 +3588,7 @@
         // after the user closes the panel. (The edge-tab "flap" is the
         // non-destructive way to tuck the panel away and bring it back.)
         closeBtn.onclick = () => {
-            try { clearInterval(bridgeTick); } catch (e) {}
+            try { if (bridgeTimer) { clearTimeout(bridgeTimer); bridgeTimer = null; } } catch (e) {}
             try { window.removeEventListener('keydown', onPanelKeydown); } catch (e) {}
             try { statsObs.disconnect(); } catch (e) {}
             try { root.remove(); } catch (e) {}
@@ -3685,9 +3812,20 @@
             // OCR button + destination pickers derive from the run lock, so
             // this periodic tick can never re-enable them mid-run.
             setRunLock(runBusy);
+            // Poll fast (1 s) while the bridge is busy — whether from our own
+            // run or background work it reports via /health — so the UI
+            // notices the moment it goes idle; otherwise settle to 10 s.
+            bridgePollFast = !!(bridgeBusy || runBusy);
+            scheduleBridgePoll();
+        }
+
+        let bridgeTimer = null;
+        let bridgePollFast = false;
+        function scheduleBridgePoll() {
+            if (bridgeTimer) { clearTimeout(bridgeTimer); bridgeTimer = null; }
+            bridgeTimer = setTimeout(updateBridgeDot, bridgePollFast ? 1000 : 10000);
         }
         updateBridgeDot();
-        const bridgeTick = setInterval(updateBridgeDot, 10000);
 
         const statsEl = document.createElement('div');
         statsEl.className = 'bwdd-cards';
@@ -3749,12 +3887,6 @@
         barWrap.setAttribute('role', 'region');
         barWrap.setAttribute('aria-label', 'Task Progress');
         barWrap.append(barDownload.wrap, barDescramble.wrap, barMokuro.wrap, barUpload.wrap);
-        // Small always-truthful legend under the Mokuro row: its rate reads
-        // done/received/total and the faint amber track is received-not-yet-OCR'd.
-        const barMokuroLegend = document.createElement('div');
-        barMokuroLegend.className = 'bwdd-bar-legend';
-        barMokuroLegend.textContent = 'done / received / total — amber = received, not yet OCR\u2019d';
-        barMokuro.wrap.appendChild(barMokuroLegend);
 
         // Actions
         const btnRow = document.createElement('div');
@@ -3801,7 +3933,7 @@
         localDirInput.id = 'bwdd-local-dir';
         localDirInput.type = 'text';
         localDirInput.className = 'bwdd-dest-input';
-        localDirInput.placeholder = 'absolute path, e.g. /Users/you/manga-library';
+        localDirInput.placeholder = 'absolute path on this computer — e.g. C:\\Users\\you\\manga or /home/you/manga';
         localDirInput.title = 'Where mokuro-bridge should write the finished volume. This is a path on the machine running the bridge (your computer).';
         // Browser note: a web page cannot read your filesystem path via a
         // folder picker (showDirectoryPicker yields an opaque handle). The
@@ -3960,7 +4092,7 @@
         localDirInput.addEventListener('change', () => { try { localStorage.setItem('bwdd-local-dir', localDirInput.value); } catch (e) {} });
         try { const saved = localStorage.getItem('bwdd-local-dir'); if (saved) localDirInput.value = saved; } catch (e) {}
         populateDestMethods();
-        try { window.__bwddUI = Object.assign(window.__bwddUI || {}, { populateDestMethods, onDestChange }); } catch (e) {}
+        if (BWDD_DEBUG) { try { window.__bwddUI = Object.assign(window.__bwddUI || {}, { populateDestMethods, onDestChange }); } catch (e) {} }
 
         // --- Run-state lock --------------------------------------------------
         // While a run is in progress the action buttons and the whole
@@ -3988,6 +4120,18 @@
             } else {
                 destWrap.removeAttribute('aria-busy');
                 destWrap.title = '';
+            }
+            // Closing or flapping the panel mid-run would orphan the pipeline
+            // (auth timers, OCR polls, the finalize stream) that keeps posting
+            // into a detached DOM — hold both header buttons until it finishes.
+            closeBtn.disabled = busy;
+            flapBtn.disabled = busy;
+            if (busy) {
+                closeBtn.title = 'Closes after the run finishes';
+                flapBtn.title = 'Available after the run finishes';
+            } else {
+                closeBtn.title = 'Close panel';
+                flapBtn.title = 'Slide the panel away to the right edge of the screen';
             }
         }
 
@@ -4126,14 +4270,19 @@
         body.append(colMain);
         root.append(head, body);
         document.documentElement.appendChild(root);
+        // The bridge dot is first updated above (buildUI), but that call runs
+        // before root is connected and bails at the `!root.isConnected` guard —
+        // so refresh it now that the panel is actually in the document, instead
+        // of waiting for the first 10 s interval tick.
+        try { updateBridgeDot(); } catch (e) {}
 
         // "Flap": slide the whole panel off the right edge of the screen. A
         // small tab stays docked on the right edge to bring it back.
         const edgeTab = document.createElement('button');
         edgeTab.type = 'button';
         edgeTab.className = 'bwdd-edge-tab';
-        edgeTab.setAttribute('aria-label', 'Show the BookWalker Downloader panel');
-        edgeTab.title = 'Show the BookWalker Downloader panel';
+        edgeTab.setAttribute('aria-label', 'Show the BookWalker Native Downloader panel');
+        edgeTab.title = 'Show the BookWalker Native Downloader panel';
         edgeTab.textContent = '\u00AB';   // fancy "<<" — pull the panel back in from the right
         edgeTab.style.display = 'none';
         document.documentElement.appendChild(edgeTab);
@@ -4394,38 +4543,64 @@
     // =====================================================================
     let authRefreshPromise = null;
     let pbCounter = 0;
-    function refreshAuthViaPb() {
+    // Refresh the CloudFront auth policy, coalesced so concurrent callers share
+    // one in-flight request. Two viewer endpoints mint a fresh auth_info;
+    // refreshAuthBest() tries 'pb' first, then 'c':
+    //   'pb' — POST a plausible reading-position bookmark to /browserWebApi/pb
+    //          (the viewer's own token-renewal channel). This mirrors what the
+    //          viewer sends while reading and therefore also moves your reading
+    //          progress on BookWalker's side each time — the fake position
+    //          cycles monotonically within the book to stay plausible.
+    //   'c'  — GET /browserWebApi/c with the params the viewer sends when
+    //          opening a book; a fresh reply replaces auth/baseUrl/cti.
+    function refreshAuthOnce(mode) {
         if (!authRefreshPromise) {
             authRefreshPromise = (async () => {
-                const ts = new Date();
-                const pad = n => String(n).padStart(2, '0');
-                const dateStr = ts.getFullYear() + '-' + pad(ts.getMonth() + 1) + '-' + pad(ts.getDate()) +
-                    'T' + pad(ts.getHours()) + ':' + pad(ts.getMinutes()) + ':' + pad(ts.getSeconds()) + '+0900';
-                pbCounter = (pbCounter || 0) + 1;
-                const pbPos = 'OEBPS/text/p-' + String((pbCounter % 900) + 1).padStart(4, '0') + '.xhtml';
-                const bookmark = JSON.stringify({
-                    date: dateStr, position: pbPos,
-                    position_later_page: '', pr: (pbCounter % 7), type: 'epub', finished: 0,
-                    bookmark_suffix_max: 1, bookmarks: [],
-                });
-                const form = new URLSearchParams();
-                form.set('cid', state.cid);
-                form.set('u1', getU1());
-                form.set('BID', getBID());
-                form.set('timestamp', '');
-                form.set('bookmark', bookmark);
-                const pbUrl = apiBase() + '/browserWebApi/pb';
-                const res = await fetchWithTimeout(pbUrl, {
-                    method: 'POST',
-                    credentials: 'include',
-                    headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
-                    body: form.toString(),
-                }, 20000);
-                const d = await res.json();
-                if (d && d.auth_info) {
-                    const before = authPolicySig();
-                    state.auth = Object.assign({}, state.auth || {}, d.auth_info);
-                    if (authPolicySig() !== before) resetAuthBudget();
+                let d;
+                if (mode === 'pb') {
+                    const ts = new Date();
+                    const pad = n => String(n).padStart(2, '0');
+                    const dateStr = ts.getFullYear() + '-' + pad(ts.getMonth() + 1) + '-' + pad(ts.getDate()) +
+                        'T' + pad(ts.getHours()) + ':' + pad(ts.getMinutes()) + ':' + pad(ts.getSeconds()) + '+0900';
+                    pbCounter = (pbCounter || 0) + 1;
+                    const pbPos = 'OEBPS/text/p-' + String((pbCounter % 900) + 1).padStart(4, '0') + '.xhtml';
+                    const bookmark = JSON.stringify({
+                        date: dateStr, position: pbPos,
+                        position_later_page: '', pr: (pbCounter % 7), type: 'epub', finished: 0,
+                        bookmark_suffix_max: 1, bookmarks: [],
+                    });
+                    const form = new URLSearchParams();
+                    form.set('cid', state.cid);
+                    form.set('u1', getU1());
+                    form.set('BID', getBID());
+                    form.set('timestamp', '');
+                    form.set('bookmark', bookmark);
+                    const res = await fetchWithTimeout(apiBase() + '/browserWebApi/pb', {
+                        method: 'POST',
+                        credentials: 'include',
+                        headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+                        body: form.toString(),
+                    }, 20000);
+                    d = await res.json();
+                    if (d && d.auth_info) {
+                        // pb merges over the current auth; only a changed
+                        // policy/signature resets the request-count budget.
+                        const before = authPolicySig();
+                        state.auth = Object.assign({}, state.auth || {}, d.auth_info);
+                        if (authPolicySig() !== before) resetAuthBudget();
+                    }
+                } else {
+                    const cr = Math.floor(Math.random() * 1e18) + 1e18;
+                    const u1 = getU1();
+                    const url = apiBase() + '/browserWebApi/c?cid=' + encodeURIComponent(state.cid) +
+                        '&u1=' + encodeURIComponent(u1) + '&BID=' + encodeURIComponent(getBID()) + '&cr=' + cr;
+                    const res = await fetchWithTimeout(url, { credentials: 'include' }, 20000);
+                    d = await res.json();
+                    if (d.status === '200' && d.auth_info && d.url) {
+                        state.auth = d.auth_info;
+                        state.baseUrl = d.url;
+                        state.cti = d.cti || state.cti;
+                    }
                 }
                 return d;
             })();
@@ -4433,27 +4608,8 @@
         }
         return authRefreshPromise;
     }
-
-    function refreshAuthViaC() {
-        if (!authRefreshPromise) {
-            authRefreshPromise = (async () => {
-                const cr = Math.floor(Math.random() * 1e18) + 1e18;
-                const u1 = getU1();
-                const url = apiBase() + '/browserWebApi/c?cid=' + encodeURIComponent(state.cid) +
-                    '&u1=' + encodeURIComponent(u1) + '&BID=' + encodeURIComponent(getBID()) + '&cr=' + cr;
-                const res = await fetchWithTimeout(url, { credentials: 'include' }, 20000);
-                const d = await res.json();
-                if (d.status === '200' && d.auth_info && d.url) {
-                    state.auth = d.auth_info;
-                    state.baseUrl = d.url;
-                    state.cti = d.cti || state.cti;
-                }
-                return d;
-            })();
-            authRefreshPromise.finally(() => { authRefreshPromise = null; });
-        }
-        return authRefreshPromise;
-    }
+    const refreshAuthViaPb = () => refreshAuthOnce('pb');
+    const refreshAuthViaC = () => refreshAuthOnce('c');
 
     async function refreshAuthBest() {
         const before = authPolicySig();
@@ -4522,7 +4678,7 @@
                 if (qIdx === -1) continue;
                 const params = new URLSearchParams(u.slice(qIdx + 1));
                 const auth = {};
-                for (const k of ['hti', 'cfg', 'bid', 'uuid', 'pfCd', 'Policy', 'Signature', 'Key-Pair-Id']) {
+                for (const k of AUTH_PARAM_KEYS) {
                     const v = params.get(k);
                     if (v !== null && v !== undefined) auth[k] = v;
                 }
@@ -4627,6 +4783,99 @@
         }
     }
 
+    // Upload the cover (<safe_title>.webp — the first page, no OCR needed)
+    // the moment it's descrambled, so the destination folder + Upload bar show
+    // activity before OCR finishes. Feeds the same per-run upload bar feed the
+    // finalize phase uses (name matches the bridge's file_base.webp, so the
+    // entry is marked done and finalize's plan just adds the .cbz/.mokuro).
+    async function uploadCoverEarly(opts) {
+        const { ui, barUpload, feed, mokuroSessionId, safeTitle, blob } = opts;
+        if (!mokuroSessionId || !blob) return null;
+        const plan = await resolveUploadChoice(ui).catch(() => ({ method: null, label: null, localDir: null }));
+        const coverName = (safeTitle || 'volume') + '.webp';
+        try {
+            barUpload.labName.textContent = '4. ' + (plan.method === 'local' ? 'Store' : 'Upload');
+            barUpload.wrap.style.display = 'flex';
+            // Seed the 1-file plan up front so the bar reads "1/1 · 0%" from
+            // the very first moment (no bare "0%" without a file count).
+            if (feed.seed) feed.seed([{ file: coverName, total_bytes: blob.size }]);
+            feed({ file: coverName, currentBytes: 0, totalBytes: blob.size, percent: 0 });
+            const res = await mokuroUploadCover(mokuroSessionId, blob, { method: plan.method || null, localDir: plan.localDir });
+            feed({ file: res && res.file ? res.file : coverName, currentBytes: res && res.size ? res.size : blob.size, totalBytes: res && res.size ? res.size : blob.size, percent: 100 });
+            return res;
+        } catch (e) {
+            // A failed early cover must never break the download/OCR run.
+            console.warn('[bwdd] Early cover upload skipped:', e && e.message || e);
+            return null;
+        }
+    }
+
+    // Finalize phase shared by the trial and full OCR pipelines (kept in one
+    // place so the two paths can never drift apart again): ask the bridge to
+    // finalize the session (store locally or upload), stream live byte/percent
+    // progress into the Store/Upload bar via the NDJSON frames, and keep the
+    // Mokuro bar polled until the stream closes. Returns { result, plan }.
+    async function finalizeOcrSession(mokuroSessionId, ui, barUpload, barMokuro, total, sharedFeed) {
+        const plan = await resolveUploadChoice(ui).catch(() => ({ method: null, label: null, localDir: null }));
+        // The 4th stage only uploads when the destination is remote — for
+        // local saves it stores to disk, so name the bar honestly. If the
+        // early cover upload already started the bar on this feed, don't
+        // clobber it — keep the visible progress and just seed the rest.
+        barUpload.labName.textContent = '4. ' + (plan.method === 'local' ? 'Store' : 'Upload');
+        const uploadFeed = sharedFeed || makeUploadBarUpdater(barUpload);
+        if (!sharedFeed || !sharedFeed.hasAny || !sharedFeed.hasAny()) {
+            barUpload.wrap.style.display = 'none';
+            setBar(barUpload, 0, '0%');
+        }
+        const result = await new Promise((resolve, reject) => {
+            const fp = mokuroFinalize(mokuroSessionId, { method: plan.method || null, localDir: plan.localDir }, (stage, msg) => {
+                if (stage === 'upload_progress' || stage === 'upload') barUpload.wrap.style.display = 'flex';
+                // The initial "upload" frame announces every file + size, so
+                // pre-size the bar before the first byte arrives.
+                if (stage === 'upload' && msg && Array.isArray(msg.files) && uploadFeed.seed) {
+                    uploadFeed.seed(msg.files);
+                }
+                // Keep the file count + total size on the bar when done —
+                // final label reads e.g. "3/3 · 100% · 145.0 MB / 145.0 MB".
+                if (stage === 'done' && uploadFeed.summary) {
+                    const s = uploadFeed.summary();
+                    if (barUpload.wrap.style.display === 'flex' && s.total > 0) {
+                        setBar(barUpload, 100, s.done + '/' + s.total + ' · 100% · ' + fmtBytes(s.sumTot) + ' / ' + fmtBytes(s.sumTot));
+                    } else if (barUpload.wrap.style.display === 'flex') {
+                        setBar(barUpload, 100, '100%');
+                    }
+                }
+            }, uploadFeed);
+            // Poll the bridge's OCR status ~2.5/s so the Mokuro bar keeps
+            // moving while the NDJSON finalize stream is open; the bridge also
+            // publishes live upload progress to the same /status endpoint
+            // (bytes/percent/speed per in-flight file), which we feed into the
+            // same accumulator — that keeps the bar moving even with older
+            // bridges that buffer their NDJSON upload frames.
+            const poll = setInterval(async () => {
+                try {
+                    const st = await mokuroStatus(mokuroSessionId);
+                    if (!st) return;
+                    updateMokuroBar(barMokuro, st.pages_ocr_done ?? 0, st.pages_received ?? 0, total);
+                    const up = st.upload;
+                    if (up && (up.active === true || (up.current_bytes || 0) > 0 || (up.percent || 0) > 0)) {
+                        barUpload.wrap.style.display = 'flex';
+                        uploadFeed({
+                            file: up.file || '',
+                            currentBytes: up.current_bytes || 0,
+                            totalBytes: up.total_bytes || 0,
+                            percent: up.percent,
+                            speed: up.speed_human || null,
+                        });
+                    }
+                } catch (e) {}
+            }, 400);
+            fp.then(r => { clearInterval(poll); resolve(r); },
+                   e => { clearInterval(poll); reject(e); });
+        });
+        return { result, plan };
+    }
+
     async function downloadTrialZip(ui, config, contents, title, sv, zipFolder, mode, details) {
         const { barDownload, barDescramble, barMokuro, barUpload, destSelect, localDirInput } = ui;
         const zip = mode === 'zip' ? { entries: [] } : null;
@@ -4656,12 +4905,13 @@
                 c.width = S.Width; c.height = S.Height;
                 c.getContext('2d').drawImage(bmp, 0, 0);
                 if (bmp.close) bmp.close();
-                return await new Promise((res2, rej) => c.toBlob(b => b ? res2(b) : rej(new Error('toBlob')), 'image/jpeg', 0.92));
+                return await new Promise((res2, rej) => c.toBlob(b => b ? res2(b) : rej(new Error('toBlob')), 'image/jpeg', JPEG_QUALITY));
             } catch (e) { return blob; }
         }
 
         let mokuroSessionId = null;
         let ocrPoll = null;
+        let runSafeTitle = '';
         if (mode === 'ocr') {
             barMokuro.wrap.style.display = 'flex';
             barMokuro.fill.style.width = '0%';
@@ -4676,6 +4926,7 @@
             }
             const sess = await mokuroStartSession(title || 'book');
             mokuroSessionId = sess.session_id;
+            runSafeTitle = sess.safe_title || sess.title || '';
             ocrPoll = setInterval(async () => {
                 const st = await mokuroStatus(mokuroSessionId);
                 if (!st) return;
@@ -4687,6 +4938,10 @@
 
         let fetched = 0;
         let nextIdx = 0;
+        // One upload-bar feed shared by the early cover upload and finalize so
+        // the bar tracks the whole multi-file upload (cover = file 1/N).
+        const trialUploadFeed = makeUploadBarUpdater(barUpload);
+        const trialCoverState = { fired: false };
         async function worker() {
             while (true) {
                 const i = nextIdx++;
@@ -4716,6 +4971,17 @@
                     fetched++;
                     if (zip) zip.entries.push({ path: zipFolder + 'page-' + String(pageIdx).padStart(4, '0') + '.jpg', blob });
                     if (mode === 'ocr' && mokuroSessionId) {
+                        // Cover = first page: push it to the destination right
+                        // away (before OCR finishes) so the folder + upload bar
+                        // show life immediately.
+                        if (pageIdx === 1 && !trialCoverState.fired) {
+                            trialCoverState.fired = true;
+                            uploadCoverEarly({
+                                ui, barUpload, feed: trialUploadFeed,
+                                mokuroSessionId, safeTitle: runSafeTitle,
+                                blob,
+                            }).catch(() => {});
+                        }
                         try { await mokuroStreamPage(mokuroSessionId, blob, 'page-' + String(pageIdx).padStart(4, '0') + '.jpg', pageIdx); }
                         catch (e) { errors.push('OCR page ' + pageIdx + ': ' + (e && e.message)); }
                     }
@@ -4746,41 +5012,7 @@
         }
         if (mode === 'ocr' && mokuroSessionId) {
             if (ocrPoll) clearInterval(ocrPoll);
-            let finalizePlan = null;
-            const result = await new Promise(async (resolve, reject) => {
-                // OCR → upload pipeline: ask the bridge which destination method
-                // is configured (upload-methods), then finalize with that method
-                // and stream live byte/percent progress into the Store/Upload bar.
-                const plan = await resolveUploadChoice(ui).catch(() => ({ method: null, label: null, localDir: null }));
-                finalizePlan = plan;
-                // The 4th stage only uploads when the destination is remote —
-                // for local saves it stores to disk, so name the bar honestly
-                // and keep it hidden until real bytes actually start flowing.
-                barUpload.labName.textContent = '4. ' + (plan.method === 'local' ? 'Store' : 'Upload');
-                barUpload.wrap.style.display = 'none';
-                setBar(barUpload, 0, '0%');
-                const fp = mokuroFinalize(mokuroSessionId, { method: plan.method || null, localDir: plan.localDir }, (stage) => {
-                    if (stage === 'upload_progress' || stage === 'upload') barUpload.wrap.style.display = 'flex';
-                    if (stage === 'done' && barUpload.wrap.style.display === 'flex') setBar(barUpload, 100, '100%');
-                }, makeUploadBarUpdater(barUpload));
-                const poll = setInterval(async () => {
-                    try {
-                        const st = await mokuroStatus(mokuroSessionId);
-                        if (!st) return;
-                        const done = st.pages_ocr_done ?? 0;
-                        const got = st.pages_received ?? 0;
-                        updateMokuroBar(barMokuro, done, got, total);
-                    } catch (e) {}
-                }, 400);
-                try {
-                    const r = await fp;
-                    clearInterval(poll);
-                    resolve(r);
-                } catch (e) {
-                    clearInterval(poll);
-                    reject(e);
-                }
-            });
+            const { result, plan } = await finalizeOcrSession(mokuroSessionId, ui, barUpload, barMokuro, total, trialUploadFeed);
             barMokuro.fill.style.width = '100%';
             barMokuro.labRate.textContent = okIdx.size + '/' + okIdx.size;
             // OCR run finished → offer the jump to read it on reader.mokuro.app
@@ -4791,12 +5023,12 @@
                     errors);
             } else {
                 // Full volume — confirm where it was stored/uploaded.
-                if (finalizePlan && finalizePlan.method === 'local') {
-                    const localPath = storedPathOf(result) || finalizePlan.localDir;
+                if (plan && plan.method === 'local') {
+                    const localPath = storedPathOf(result) || plan.localDir;
                     if (localPath) details.textContent = msgStoredLocal(localPath);
-                } else if (finalizePlan && finalizePlan.method) {
+                } else if (plan && plan.method) {
                     const rp = result && (result.remote_path || result.mega_path);
-                    if (rp) details.textContent = msgUploadedTo(methodShortLabel(finalizePlan.method), rp);
+                    if (rp) details.textContent = msgUploadedTo(methodShortLabel(plan.method), rp);
                 }
                 if (errors.length) appendRunDetails(details, errors, 'Issues during the run');
             }
@@ -4820,7 +5052,7 @@
             const url = URL.createObjectURL(zipBlob);
             const a = document.createElement('a');
             a.href = url;
-            a.download = (sv.series || title || 'book') + '.zip';
+            a.download = zipBaseName(sv, title) + '.zip';
             document.body.appendChild(a);
             a.click();
             setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 4000);
@@ -4847,10 +5079,26 @@
         } catch (e) { state.viewerEntries = []; }
     }
     function resetRunState() {
+        // All captured state below is per-book. If this tab has moved to a
+        // different cid since the last run (SPA-style navigation), the cached
+        // config/keys belong to the previous book — reusing them would silently
+        // download the wrong pages (every CDN path 403s with a confusing
+        // "session auth expired" message). Detect that and reset the config too.
+        const currentCid = (new URLSearchParams(location.search)).get('cid') || '';
+        const cidChanged = currentCid !== state.cid;
+        state.cid = currentCid;
         state.fileBases = {};
         state.auth = null;
         state.baseUrl = null;
         state.viewerEntries = [];
+        if (cidChanged) {
+            state.decodedConfig = null;
+            state.configBody = null;
+            state.configFromUrl = null;
+            state.keys = null;
+            state.plaintextConfig = false;
+            state.cti = null;
+        }
     }
 
     async function run(ui, mode) {
@@ -4880,7 +5128,7 @@
             if ((state.plaintextConfig || !keys) && (mode === 'zip' || mode === 'ocr')) {
                 const titleT = cleanTitle(state.cti || document.title) || state.cid;
                 const svT = splitSeriesVolume(state.cti || titleT);
-                const zipFolderT = (svT.series ? svT.series + '/' + (svT.volumeTitle || titleT) + '/' : '');
+                const zipFolderT = zipLayoutOf(svT, titleT);
                 barWrap.style.display = 'flex';
                 barDownload.wrap.style.display = 'flex';
                 barDescramble.wrap.style.display = 'flex';
@@ -4901,9 +5149,9 @@
                     title: titleT,
                     pages: expT,
                     resolution: `${WT} × ${HT}`,
-                    estSize: fmtBytes(expT * 350 * 1024),
                     type: 'Sample / Trial'
                 });
+                if (svT.series) fetchAndRenderStats(statsEl, svT.series, svT.volNum);
                 const trialOk = await downloadTrialZip(ui, config, contents, titleT, svT, zipFolderT, mode, details);
                 if (trialOk) finishedOk = true;
                 return;
@@ -4915,13 +5163,11 @@
             const H = firstPage && firstPage.Size ? firstPage.Size.Height : '?';
             const title = cleanTitle(state.cti || document.title) || state.cid;
             const sv = splitSeriesVolume(state.cti || title);
-            const estPerPageKB = 350;
 
             renderBookCard(statsEl, {
                 title,
                 pages: total,
                 resolution: `${W} × ${H}`,
-                estSize: fmtBytes(total * estPerPageKB * 1024),
                 type: 'Full Edition'
             });
 
@@ -4931,17 +5177,18 @@
             barDownload.fill.style.width = '0%';
             barDescramble.fill.style.width = '0%';
 
-            if (sv.series) {
-                fetchMangaStats(sv.series, sv.volNum).then(stats => {
-                    renderStatsCards(statsEl, stats);
-                }).catch(e => console.warn('[bwdd] Stats lookup background error:', e && e.message));
-            }
+            if (sv.series) fetchAndRenderStats(statsEl, sv.series, sv.volNum);
 
             const zip = mode === 'zip' ? { entries: [] } : null;
-            const zipFolder = (sv.series ? sv.series + '/' + sv.volumeTitle + '/' : '');
+            const zipFolder = zipLayoutOf(sv, title);
 
             let mokuroSessionId = null;
             let ocrPoll = null;
+            let runSafeTitle = '';
+            // One upload-bar feed shared by the early cover upload and finalize
+            // so the bar tracks the whole multi-file upload (cover = file 1/N).
+            const runUploadFeed = makeUploadBarUpdater(barUpload);
+            const runCoverState = { fired: false };
             if (mode === 'ocr') {
                 barWrap.style.display = 'flex';
                 barMokuro.wrap.style.display = 'flex';
@@ -4958,6 +5205,7 @@
                 }
                 const sess = await mokuroStartSession(title);
                 mokuroSessionId = sess.session_id;
+                runSafeTitle = sess.safe_title || sess.title || '';
                 ocrPoll = setInterval(async () => {
                     const st = await mokuroStatus(mokuroSessionId);
                     if (!st) return;
@@ -5042,6 +5290,17 @@
                     bytes += blob.size;
                     if (zip) zip.entries.push({ path: zipFolder + 'page-' + String(job.index).padStart(4, '0') + '.jpg', blob });
                     if (state.cid) cachePage(state.cid, job.index, blob);
+                    // Cover = first page: push it to the destination right
+                    // away (before OCR finishes) so the folder + upload bar
+                    // show life immediately.
+                    if (mokuroSessionId && job.index === 1 && !runCoverState.fired) {
+                        runCoverState.fired = true;
+                        uploadCoverEarly({
+                            ui, barUpload, feed: runUploadFeed,
+                            mokuroSessionId, safeTitle: runSafeTitle,
+                            blob,
+                        }).catch(() => {});
+                    }
                     if (mokuroSessionId) {
                         ocrBuffer.set(job.index, blob);
                         if (job.index === nextOcr) sendOcrStreaming();
@@ -5062,7 +5321,7 @@
                         pending.set(j2.id, j2);
                         if (pool) pool.submit(j2);
                         else {
-                            fetchAndDescramble(j2.relPath, j2.seeds, 0.92, JOB_TIMEOUT)
+                            fetchAndDescramble(j2.relPath, j2.seeds, JPEG_QUALITY, JOB_TIMEOUT)
                                 .then(blob => settleJob(j2, null, blob))
                                 .catch(e => settleJob(j2, String((e && e.message) || e), null));
                         }
@@ -5176,7 +5435,7 @@
                         consumed++;
                         const j = item.job;
                         const id = ++seq;
-                        const job = { id, index: j.index, fid: j.fid, relPath: j.rel, seeds: j.seeds, auth: state.auth, baseUrl: state.baseUrl, q: 0.92, retried: false };
+                        const job = { id, index: j.index, fid: j.fid, relPath: j.rel, seeds: j.seeds, auth: state.auth, baseUrl: state.baseUrl, q: JPEG_QUALITY, retried: false };
                         pending.set(id, job);
                         job._resolve = null;
                         const p = new Promise(res => { job._resolve = res; });
@@ -5189,8 +5448,8 @@
                             (async () => {
                                 try {
                                     const blob = item.blob
-                                        ? await decodeBlobMain(item.blob, job.seeds, 0.92)
-                                        : await fetchAndDescramble(job.relPath, job.seeds, 0.92, JOB_TIMEOUT);
+                                        ? await decodeBlobMain(item.blob, job.seeds, JPEG_QUALITY)
+                                        : await fetchAndDescramble(job.relPath, job.seeds, JPEG_QUALITY, JOB_TIMEOUT);
                                     settleJob(job, null, blob);
                                 } catch (e) {
                                     settleJob(job, String((e && e.message) || e), null);
@@ -5261,7 +5520,6 @@
                     title,
                     pages: total,
                     resolution: `${W} × ${H}`,
-                    estSize: fmtBytes(total * estPerPageKB * 1024),
                     type: 'Full Edition'
                 });
             }
@@ -5312,41 +5570,7 @@
                 }
                 if (ocrPoll) clearInterval(ocrPoll);
                 barMokuro.wrap.style.display = 'flex';
-                let finalizePlan = null;
-                const result = await new Promise(async (resolve, reject) => {
-                    // OCR → upload pipeline: ask the bridge which destination method
-                // is configured (upload-methods), then finalize with that method
-                // and stream live byte/percent progress into the Store/Upload bar.
-                const plan = await resolveUploadChoice(ui).catch(() => ({ method: null, label: null, localDir: null }));
-                finalizePlan = plan;
-                // The 4th stage only uploads when the destination is remote —
-                // for local saves it stores to disk, so name the bar honestly
-                // and keep it hidden until real bytes actually start flowing.
-                barUpload.labName.textContent = '4. ' + (plan.method === 'local' ? 'Store' : 'Upload');
-                barUpload.wrap.style.display = 'none';
-                setBar(barUpload, 0, '0%');
-                const fp = mokuroFinalize(mokuroSessionId, { method: plan.method || null, localDir: plan.localDir }, (stage) => {
-                    if (stage === 'upload_progress' || stage === 'upload') barUpload.wrap.style.display = 'flex';
-                    if (stage === 'done' && barUpload.wrap.style.display === 'flex') setBar(barUpload, 100, '100%');
-                }, makeUploadBarUpdater(barUpload));
-                    const poll = setInterval(async () => {
-                        try {
-                            const st = await mokuroStatus(mokuroSessionId);
-                            if (!st) return;
-                            const done = st.pages_ocr_done ?? 0;
-                            const got = st.pages_received ?? 0;
-                            updateMokuroBar(barMokuro, done, got, total);
-                        } catch (e) {}
-                    }, 400);
-                    try {
-                        const r = await fp;
-                        clearInterval(poll);
-                        resolve(r);
-                    } catch (e) {
-                        clearInterval(poll);
-                        reject(e);
-                    }
-                });
+                const { result, plan } = await finalizeOcrSession(mokuroSessionId, ui, barUpload, barMokuro, total, runUploadFeed);
                 const secs = ((performance.now() - t0) / 1000).toFixed(1);
                 if (failedIdx.size === 0) finishedOk = true;
                 barMokuro.fill.style.width = '100%';
@@ -5359,12 +5583,12 @@
                         errors);
                 } else {
                     // Full volume — confirm where it was stored/uploaded.
-                    if (finalizePlan && finalizePlan.method === 'local') {
-                        const localPath = storedPathOf(result) || finalizePlan.localDir;
+                    if (plan && plan.method === 'local') {
+                        const localPath = storedPathOf(result) || plan.localDir;
                         if (localPath) details.textContent = msgStoredLocal(localPath);
-                    } else if (finalizePlan && finalizePlan.method) {
+                    } else if (plan && plan.method) {
                         const rp = result && (result.remote_path || result.mega_path);
-                        if (rp) details.textContent = msgUploadedTo(methodShortLabel(finalizePlan.method), rp);
+                        if (rp) details.textContent = msgUploadedTo(methodShortLabel(plan.method), rp);
                     }
                     if (errors.length) appendRunDetails(details, errors, 'Issues during the run');
                 }
@@ -5407,7 +5631,7 @@
             const url = URL.createObjectURL(zipBlob);
             const a = document.createElement('a');
             a.href = url;
-            a.download = (sv.series || title) + '.zip';
+            a.download = zipBaseName(sv, title) + '.zip';
             document.body.appendChild(a);
             a.click();
             setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 4000);
@@ -5430,19 +5654,9 @@
             // memory hygiene: a finished download must not keep gigabytes of
             // blobs or an ever-growing IndexedDB cache behind.
             if (finishedOk) clearPageCache();
-            dropRunBlobs();
+            // Run-local blobs (zip entries, OCR buffers, the ready queue) are
+            // function-scoped and become garbage once run() returns.
         }
-    }
-
-    // Drop the in-memory blob references held by the last run (zip entries,
-    // OCR buffer, ready queue) so the garbage collector can reclaim them.
-    function dropRunBlobs() {
-        try {
-            window.__bwddRunBlobs = null;
-            if (typeof state === 'object' && state) {
-                // state holds decoded config etc.; keep it but free heavy refs
-            }
-        } catch (e) {}
     }
 
     function decodeConfigWithKeys(content) {
@@ -5496,7 +5710,6 @@
                 title,
                 pages,
                 resolution: `${W} × ${H}`,
-                estSize: fmtBytes(pages * 350 * 1024),
                 type: isPlain ? 'Sample / Trial' : 'Full Edition'
             };
         } catch (e) { return null; }
@@ -5514,14 +5727,23 @@
         try { prunePageCache(); } catch (e) {}
 
         (async () => {
+            let statsKicked = false;
             for (let i = 0; i < 40; i++) {
                 await new Promise(r => setTimeout(r, 500));
+                if (!statsKicked) {
+                    // Start the catalog lookups as soon as the series name is
+                    // known (state.cti) — not once the whole preview finishes
+                    // decoding — and only once; each card renders on its own.
+                    try {
+                        const sv = splitSeriesVolume(state.cti || document.title || '');
+                        if (sv.series) {
+                            fetchAndRenderStats(ui.statsEl, sv.series, sv.volNum);
+                            statsKicked = true;
+                        }
+                    } catch (e) {}
+                }
                 const preview = buildBookPreview();
                 if (preview) {
-                    // Book metadata only. The LearnNatively / Manga-Kotoba
-                    // lookups (and the cross-origin permission they need) are
-                    // deferred until the user's first download/OCR run, so an
-                    // idle panel makes no background requests and stays quiet.
                     renderBookCard(ui.statsEl, preview);
                     break;
                 }
@@ -5532,6 +5754,10 @@
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
     else boot();
 
-    try { window.__bwdd = { decodeConfig, pageSeeds, A9p, b8g, state, buildWorkerSource, fetchAndDescramble }; } catch (e) {}
-    try { window.__bwddUI = { renderStatsCards, renderBookCard, renderNativelyCard, renderMangaKotobaCard, setBar, showBars }; } catch (e) {}
+    if (BWDD_DEBUG) {
+        // pageSeedsNo/b8gNo (not the old pageSeeds/b8g wrappers) so debuggers can
+        // probe any specific page number, not just page 0.
+        try { window.__bwdd = { decodeConfig, pageSeedsNo, A9p, b8gNo, state, buildWorkerSource, fetchAndDescramble, cleanTitle, splitSeriesVolume, fsSafePath, zipLayoutOf, zipBaseName, crc32Bytes, buildStoreZip }; } catch (e) {}
+        try { window.__bwddUI = { renderStatsCards, renderBookCard, renderNativelyCard, renderMangaKotobaCard, setBar, showBars }; } catch (e) {}
+    }
 })();
