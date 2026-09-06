@@ -55,7 +55,7 @@ Most scripts for this site fall into two camps: *page-turners* that flip through
 ## Installation
 
 1. Install a userscript manager: [Tampermonkey](https://www.tampermonkey.net/) (Chrome/Firefox/Edge) or [Violentmonkey](https://violentmonkey.github.io/).
-2. Open [`bookwalker-native-downloader.user.js`](bookwalker-native-downloader.user.js) and click **Install**.
+2. Install the script from [GreasyFork](https://greasyfork.org/en/scripts/594508-bookwalker-native-downloader) (recommended), or open [`bookwalker-native-downloader.user.js`](bookwalker-native-downloader.user.js) and click **Install**.
 3. Open any book in the BookWalker viewer and use the panel.
 
 > **Important: turn off other BookWalker userscripts.** Any other userscript that runs on BookWalker must be disabled for this script to work. Other downloaders and page-capture scripts interfere with the viewer's network traffic, which this script relies on to capture the signed CDN URLs it uses to fetch pages directly. Disable them in your userscript manager before running this one.

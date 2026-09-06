@@ -1,0 +1,11 @@
+BookWalker Native Downloader
+
+Download the book open in the BookWalker viewer as a ZIP of clean, full-resolution page images, or send its pages through the mokuro OCR pipeline (mokuro-bridge + mokuro) for Japanese OCR, with the finished volume stored locally or uploaded to your own cloud. No page-flipping and no canvas scraping: pages are fetched directly from BookWalker's CDN and the tile-shuffled images are unscrambled offline, with parallel downloading, auto-renewing auth, and resume support.
+
+mokuro-bridge is optional but highly recommended. Without it the script still works fully as a downloader: you get the ZIP of clean page images and can stop there. Install mokuro-bridge (and the mokuro engine it runs) and the same pages flow straight into Japanese OCR, with the finished volume stored locally or uploaded to your own cloud, ready to open in reader.mokuro.app. The OCR pipeline is where the script really shines, so the bridge is well worth the setup.
+
+Important: any other userscripts that run on BookWalker must be turned off for this script to work. Other downloaders and page-capture scripts interfere with the viewer's network traffic, which this script relies on to capture the signed CDN URLs it uses to fetch pages directly. Disable them in your userscript manager before running this one.
+
+While a book is open, the panel also looks the title up on manga-kotoba.com and Natively (LearnNatively) and shows reading stats inline: vocabulary counts, unique words, used-once rate and lexical density from manga-kotoba, plus difficulty level, ratings and reader counts from Natively, so you can judge how readable a volume is before you download it.
+
+On first install, your userscript manager will ask for cross-origin access to learnnatively.com and manga-kotoba.com. That permission only powers those reading-stats cards. If you decline, downloading and OCR work exactly the same; the Natively card is then fetched through a public CORS proxy instead, and if that is unreachable it simply shows a "not available" note and nothing breaks.
