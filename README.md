@@ -1,6 +1,8 @@
 # BookWalker Native Downloader · v1.0.0
 
-Download the book you have open in the [BookWalker browser viewer](https://viewer.bookwalker.jp) as a **ZIP of clean, full-resolution page images**, or push its pages straight into a **mokuro Japanese-OCR pipeline** and have the finished volume land in your reader. All in one floating panel, without you flipping a single page.
+**[Download from GreasyFork](https://greasyfork.org/en/scripts/594508-bookwalker-native-downloader)** · or install the [raw userscript](bookwalker-native-downloader.user.js) · MIT licensed
+
+Download the book you have open in the [BookWalker browser viewer](https://bookwalker.jp) as a **ZIP of clean, full-resolution page images**, or push its pages straight into a **mokuro Japanese-OCR pipeline** and have the finished volume land in your reader. All in one floating panel, without you flipping a single page.
 
 <div align="center">
 <img width="944" height="703" alt="image" src="https://github.com/user-attachments/assets/73fb5156-072b-496c-98db-00a931663993" />
